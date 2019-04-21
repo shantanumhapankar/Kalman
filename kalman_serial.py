@@ -1,28 +1,12 @@
+import serial
 import numpy as np
-from geopy import distance
+from datetime import datetime
 import math
 
 # Earths gravity
 GRAVITY = 9.80665
 # Radius in meters
 EARTH_RADIUS = 6371 * 1000.0 
-
-# List of all data_dicts
-data_list = []
-data_dict = {
-    "timestamp": 0,
-    "gps_lat": 0,
-    "gps_lon": 0,
-    "gps_alt": 0,
-    "pitch": 0,
-    "yaw": 0,
-    "roll": 0,
-    "rel_forward_acc": 0,
-    "rel_up_acc": 0,
-    "abs_north_acc": 0,
-    "abs_east_acc": 0,
-    "abs_up_acc": 0
-}
 
 # Convert DMS to degrees.
 def parseDms(lat, latdir, lon, londir):
@@ -52,8 +36,6 @@ def getDistanceM(lat1, lon1, lat2, lon2):
 
 # Convert lat and long points from degrees to meters using the haversine formula. 
 def LatLonToM(lat, lon):
-    # latdis = distance.great_circle((lat,0.0),(0.0,0.0)).meters
-    # londis = distance.great_circle((0.0,lon),(0.0,0.0)).meters
     latdis = getDistanceM(lat, 0.0, 0.0, 0.0)
     londis = getDistanceM(0.0, lon, 0.0, 0.0)
     if lat < 0: latdis *= -1
@@ -89,22 +71,17 @@ def metersToGeopoint(latM, lonM):
     nelat, nelon = getPointAhead(elat, elon, latM, 0.0)
     return nelat, nelon
 
-def readData():
-    with open('data.txt', 'r') as f:
-        text = f.read().splitlines()
-        del text[-1]
-        for line in text:
-            temp = line.replace(' -> ',',').split(',')
-            time = temp[0].split(':')
-            data_dict['timestamp'] = float(time[0])*3600 + float(time[1])*60 + float(time[2])
-            lat, lon = parseDms(float(temp[1]), temp[2], float(temp[3]), temp[4])
-            data_dict['gps_lat'] = lat
-            data_dict['gps_lon'] = lon
-            data_dict['abs_north_acc'] = float(temp[7])
-            data_dict['abs_east_acc'] = float(temp[6])
-            data_dict['abs_up_acc'] = 0
-            data_dict['yaw'] = float(temp[9])
-            data_list.append(dict(data_dict))
+def openSer():
+    return serial.Serial('/dev/ttyACM0', 9600)
+
+def serData(fd):
+    line = fd.readline()
+    if  line != None:
+        return line.split(',')
+
+def convertSecs(timenow):
+    time = timenow.split(':')
+    return float(time[0])*3600 + float(time[1])*60 + float(time[2])
 
 class Kalman():
     def __init__(self, initPos, initVel, gpsSD, accSD, time):
@@ -193,53 +170,52 @@ class Kalman():
     def getPredictedVelocity(self):
         return self.currentstate[1,0]
 
+def main():
+    # Open Serial Port
+    serFD = openSer()
 
-readData()
-
-with open('kalmanres.txt', 'w') as f1, open('original.txt', 'w') as f2:
-
+    # Define standard deviation for lat, long. 2.0 to be safe.
     latlonSD = 2.0 
-    altSD = 3.518522417151836
-
-    # got this value by getting standard deviation from accelerometer, assuming that mean SHOULD be 0
+    # Accelerometer standard deviation received after few readings from IMU.
     accESD = GRAVITY * 0.033436506994600976
     accNSD = GRAVITY * 0.05355371135598354
     accUSD = GRAVITY * 0.2088683796078286
 
-    initialData = data_list[0]
-    lat, lon = LatLonToM(initialData['gps_lat'], initialData['gps_lon'])
+    # Read serial data but wait for valid lat, long values to initialize the filter.
+    datalist = serData(serFD)
+    while (float(datalist[0]) == 0.0):
+        datalist = serData(serFD)
 
-    latKalman = Kalman(lat, 0.0, latlonSD, accNSD, initialData['timestamp'])
-    lonKalman = Kalman(lon, 0.0, latlonSD, accESD, initialData['timestamp'])
-    # altKalman = Kalman(initialData['gps_alt'], 0.0, altSD, accUSD, initialData['timestamp'])
+    timestamp = convertSecs(str(datetime.now().time()))
 
-    for i in range(1, len(data_list), 1):
-        curr_data = data_list[i]
-        latKalman.predict(GRAVITY * float(curr_data['abs_north_acc']), curr_data['timestamp'])
-        lonKalman.predict(GRAVITY * float(curr_data['abs_east_acc']), curr_data['timestamp'])
-        # altKalman.predict(GRAVITY * float(curr_data['abs_up_acc']), curr_data['timestamp'])
+    # Get lat, long values in degrees and then meters.
+    lat, lon = parseDms(float(datalist[0]), datalist[1], float(datalist[2]), datalist[3])
+    latM, lonM = LatLonToM(lat, lon)
 
-        if curr_data['gps_lat'] != 0.0:
-            lat, lon = LatLonToM(curr_data['gps_lat'], curr_data['gps_lon'])
-            latKalman.update(lat, 0.0, None, 0.0)
-            lonKalman.update(lon, 0.0, None, 0.0)
-            # altKalman.update(curr_data['gps_alt'], 0.0, None, 0.0)
-            f2.write(str(curr_data['gps_lat']) + ',' + str(curr_data['gps_lon']))
-            f2.write("\n")
+    # Initialize the kalman filters for lat and long.
+    latKalman = Kalman(latM, 0.0, latlonSD, accNSD, timestamp)
+    lonKalman = Kalman(lonM, 0.0, latlonSD, accESD, timestamp)
+
+    # Now that kalman is initialized, read data, predict and update in an infinite loop.
+    while(1):
+        datalist = serData(serFD)
+        timestampc = convertSecs(str(datetime.now().time()))
+        latKalman.predict(GRAVITY * float(datalist[6]), timestampc)
+        lonKalman.predict(GRAVITY * float(datalist[5]), timestampc)
+
+        if float(datalist[0]) != 0.0:
+            lat, lon = parseDms(float(datalist[0]), datalist[1], float(datalist[2]), datalist[3])
+            latM, lonM = LatLonToM(lat, lon)
+            latKalman.update(latM, 0.0, None, 0.0)
+            lonKalman.update(lonM, 0.0, None, 0.0)
 
         pLatM = latKalman.getPredictedPosition()
         pLonM = lonKalman.getPredictedPosition()
-        # pAltM = altKalman.getPredictedPosition()
 
         pLat, pLon = metersToGeopoint(pLatM, pLonM)
 
-        if curr_data['gps_lat'] != 0.0:
-            f1.write(str(pLat) + ',' + str(pLon))
-            f1.write("\n")
+        
 
-        # pVelE = lonKalman.getPredictedVelocity()
-        # pVelN = latKalman.getPredictedVelocity()
-
-        # V = math.sqrt(math.pow(pVelE, 2) + math.pow(pVelN, 2))
-
+if __name__ == "__main__":
+    main()
         
