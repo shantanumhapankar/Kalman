@@ -2,11 +2,26 @@ import serial
 import numpy as np
 from datetime import datetime
 import math
+import pprint
+
+dest_lat = 3518.5730
+dest_lat_dir = 'N'
+dest_lon = 8044.5298
+dest_lon_dir = 'W'
+dest_alt = 199.80
 
 # Earths gravity
 GRAVITY = 9.80665
 # Radius in meters
 EARTH_RADIUS = 6371 * 1000.0 
+
+def getBearing(lat1,lon1,lat2,lon2):
+    dLon = lon2 - lon1;
+    y = math.sin(dLon) * math.cos(lat2);
+    x = math.cos(lat1)*math.sin(lat2) - math.sin(lat1)*math.cos(lat2)*math.cos(dLon);
+    brng = np.rad2deg(math.atan2(y, x));
+    if brng < 0: brng+= 360
+    return brng
 
 # Convert DMS to degrees.
 def parseDms(lat, latdir, lon, londir):
@@ -174,12 +189,15 @@ def main():
     # Open Serial Port
     serFD = openSer()
 
-    # Define standard deviation for lat, long. 2.0 to be safe.
-    latlonSD = 2.0 
+    # Define standard deviation for lat, long. 3.0 as per datasheet. 
+    latlonSD = 6.0 
+
+    altSD = 10.0
+
     # Accelerometer standard deviation received after few readings from IMU.
-    accESD = GRAVITY * 0.033436506994600976
-    accNSD = GRAVITY * 0.05355371135598354
-    accUSD = GRAVITY * 0.2088683796078286
+    accNSD = GRAVITY * 0.367107577589
+    accESD = GRAVITY * 0.313021102282
+    accUSD = GRAVITY * 0.376713286794
 
     # Read serial data but wait for valid lat, long values to initialize the filter.
     datalist = serData(serFD)
@@ -195,26 +213,81 @@ def main():
     # Initialize the kalman filters for lat and long.
     latKalman = Kalman(latM, 0.0, latlonSD, accNSD, timestamp)
     lonKalman = Kalman(lonM, 0.0, latlonSD, accESD, timestamp)
+    altKalman = Kalman(float(datalist[4]), 0.0, altSD, accUSD, timestamp)
 
+    dlat, dlon = parseDms(dest_lat, dest_lat_dir, dest_lon, dest_lon_dir)
+
+    data_dict = {
+        "timestamp": 0,
+        "gps_lat": 0,
+        "gps_lon": 0,
+        "gps_alt": 0,
+        "pred_lat": 0,
+        "pred_lon": 0,
+        "pred_alt": 0,
+        "abs_north_acc": 0,
+        "abs_east_acc": 0,
+        "abs_up_acc": 0,
+        "mag_heading": 0
+    }
     # Now that kalman is initialized, read data, predict and update in an infinite loop.
-    while(1):
-        datalist = serData(serFD)
-        timestampc = convertSecs(str(datetime.now().time()))
-        latKalman.predict(GRAVITY * float(datalist[6]), timestampc)
-        lonKalman.predict(GRAVITY * float(datalist[5]), timestampc)
+    with open('kalman.txt', 'w') as f1:
+        try:
+            while(1):
 
-        if float(datalist[0]) != 0.0:
-            lat, lon = parseDms(float(datalist[0]), datalist[1], float(datalist[2]), datalist[3])
-            latM, lonM = LatLonToM(lat, lon)
-            latKalman.update(latM, 0.0, None, 0.0)
-            lonKalman.update(lonM, 0.0, None, 0.0)
+                datalist = serData(serFD)
+                data_dict['timestamp'] = convertSecs(str(datetime.now().time()))
+                data_dict['gps_alt'] = float(datalist[4])
+                data_dict['abs_east_acc'] = float(datalist[5])
+                data_dict['abs_north_acc'] = float(datalist[6]) 
+                data_dict['abs_up_acc'] = float(datalist[7])
+                data_dict['mag_heading'] = float(datalist[8])
+                # print "Kalman Prediction step with accelerometer data."
+                # print ''
+                latKalman.predict(GRAVITY * data_dict['abs_north_acc'], data_dict['timestamp'])
+                lonKalman.predict(GRAVITY *  data_dict['abs_east_acc'], data_dict['timestamp'])
+                altKalman.predict(GRAVITY *  data_dict['abs_up_acc'], data_dict['timestamp'])
 
-        pLatM = latKalman.getPredictedPosition()
-        pLonM = lonKalman.getPredictedPosition()
+                if float(datalist[0]) != 0.0:
+                    print ''
+                    print "Data received from GPS; Kalman Update step."
+                    data_dict['gps_lat'], data_dict['gps_lon'] = parseDms(float(datalist[0]), datalist[1], float(datalist[2]), datalist[3])
 
-        pLat, pLon = metersToGeopoint(pLatM, pLonM)
 
-        
+                    latM, lonM = LatLonToM(data_dict['gps_lat'], data_dict['gps_lon'])
+                    latKalman.update(latM, 0.0, None, 0.0)
+                    lonKalman.update(lonM, 0.0, None, 0.0)
+                    altKalman.update(data_dict['gps_alt'], 0.0, None, 0.0)
+
+                    pp = pprint.PrettyPrinter(indent = 4)
+                    pp.pprint(data_dict)
+                else:
+                    data_dict['gps_lat'] = 0.0
+                    data_dict['gps_lon'] = 0.0
+                pLatM = latKalman.getPredictedPosition()
+                pLonM = lonKalman.getPredictedPosition()
+                pAlt = altKalman.getPredictedPosition()
+                
+                data_dict['pred_lat'], data_dict['pred_lon'] = metersToGeopoint(pLatM, pLonM)
+                data_dict['pred_alt'] = pAlt
+                print ''
+                bearing = getBearing(data_dict['pred_lat'], data_dict['pred_lon'], dlat, dlon)
+                print "Distance to destination: " + str(getDistanceM(data_dict['pred_lat'], data_dict['pred_lon'], dlat, dlon)) + " meters."
+                print "Angle to steer: Bearing - Heading = " + str(bearing) + " - " + str(data_dict['mag_heading']) + ": " + str(bearing- data_dict['mag_heading'])
+                print ''
+
+
+
+                f1.write(str(data_dict['gps_lat']) + ',' + str(data_dict['gps_lon']) + ',' + str(data_dict['gps_alt']) + ',' + str(data_dict['pred_lat']) + ',' + str(data_dict['pred_lon']) + ',' + str(data_dict['pred_alt']))
+                f1.write('\n')
+                # print str(datetime.now().time()) + ' Lat, Long from GPS: (' + str(lat) + ',' + str(data_dict['gps_lon']) + '), ' + 'Kalman predicted Lat, Long: (' + str(pLat) + ',' + str(pLon) + '), ' + 'Acc N, E: (' + str(datalist[5]) + ',' + str(datalist[4]) + ')'
+                # print ''
+ 
+
+        except KeyboardInterrupt:
+            print "\n\n"
+            print "Ctrl+C; shutting the program."
+            f1.flush()
 
 if __name__ == "__main__":
     main()
